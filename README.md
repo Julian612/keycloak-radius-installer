@@ -7,4 +7,4 @@ Getestet mit Keycloak (Quarkus) aus Proxmox Helper Scripts.
 ## Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Julian612/keycloak-radius-installer/main/install-keycloak-radius.sh | bash
+curl -fsSLO https://raw.githubusercontent.com/Julian612/keycloak-radius-installer/main/install-keycloak-radius.sh
