@@ -1,75 +1,141 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-log(){ echo "[INFO] $*"; }
-warn(){ echo "[WARN] $*" >&2; }
-err(){ echo "[ERROR] $*" >&2; exit 1; }
+# ------------------------------------------------------------
+# Keycloak RADIUS Plugin Installer (UniFi-friendly)
+# - Resolves release assets via GitHub API (no hardcoded filenames)
+# - Installs ONLY radius-plugin jar by default (no Mikrotik)
+# - Creates/updates /opt/keycloak/config/radius.config
+# - Removes *-tests/*-sources/*-javadoc jars to avoid split-package warnings
+# - Runs kc.sh build + systemctl restart keycloak
+# ------------------------------------------------------------
 
-require_root() {
-  [[ "${EUID:-$(id -u)}" -eq 0 ]] || err "Bitte als root ausführen."
+REPO="vzakharchenko/keycloak-radius-plugin"
+GH_API="https://api.github.com/repos/${REPO}"
+KEYCLOAK_HOME_DEFAULT="/opt/keycloak"
+RADIUS_CONFIG_DEFAULT_REL="config/radius.config"
+
+log() { echo "[INFO] $*"; }
+warn() { echo "[WARN] $*" >&2; }
+die() { echo "[ERROR] $*" >&2; exit 1; }
+
+need_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Bitte als root ausführen."
+  fi
+}
+
+install_deps() {
+  log "Installiere Abhängigkeiten (curl, jq, openssl, iproute2, ca-certificates)…"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl jq openssl iproute2 ca-certificates
 }
 
 detect_keycloak_home() {
-  if [[ -n "${KEYCLOAK_HOME:-}" && -d "$KEYCLOAK_HOME" ]]; then
-    echo "$KEYCLOAK_HOME"; return
+  local kc_home="${KEYCLOAK_HOME:-}"
+  if [[ -z "$kc_home" ]]; then
+    if [[ -d "$KEYCLOAK_HOME_DEFAULT" && -x "$KEYCLOAK_HOME_DEFAULT/bin/kc.sh" ]]; then
+      kc_home="$KEYCLOAK_HOME_DEFAULT"
+    else
+      die "Keycloak nicht gefunden. Setze KEYCLOAK_HOME oder installiere Keycloak nach /opt/keycloak."
+    fi
   fi
-  if [[ -d /opt/keycloak ]]; then
-    echo "/opt/keycloak"; return
-  fi
-  err "Keycloak Home nicht gefunden. Setze KEYCLOAK_HOME (z.B. /opt/keycloak)."
+  [[ -x "$kc_home/bin/kc.sh" ]] || die "kc.sh nicht gefunden unter: $kc_home/bin/kc.sh"
+  echo "$kc_home"
 }
 
-install_deps_debian() {
-  if command -v apt-get >/dev/null 2>&1; then
-    log "Installiere Abhängigkeiten (curl, jq, unzip, openssl, ss)…"
-    apt-get update -y
-    apt-get install -y curl jq unzip openssl iproute2 ca-certificates
+prompt() {
+  local var_name="$1"
+  local question="$2"
+  local default="${3:-}"
+  local secret="${4:-false}"
+
+  local value=""
+  if [[ "$secret" == "true" ]]; then
+    if [[ -n "$default" ]]; then
+      read -r -s -p "$question [$default]: " value; echo
+    else
+      read -r -s -p "$question: " value; echo
+    fi
   else
-    warn "Kein apt-get gefunden. Stelle sicher, dass curl/jq/unzip/openssl/ss vorhanden sind."
+    if [[ -n "$default" ]]; then
+      read -r -p "$question [$default]: " value
+    else
+      read -r -p "$question: " value
+    fi
   fi
+
+  if [[ -z "$value" ]]; then value="$default"; fi
+  printf -v "$var_name" "%s" "$value"
 }
 
-prompt_secret() {
-  local default_secret="$1"
-  echo
-  echo "Shared Secret für RADIUS:"
-  echo " - Enter = zufällig generiert"
-  echo " - oder eigenes Secret eingeben"
-  read -r -s -p "Shared Secret: " s || true
-  echo
-  if [[ -z "${s:-}" ]]; then
-    echo "$default_secret"
-  else
-    echo "$s"
-  fi
+gh_latest_tag() {
+  curl -fsSL "${GH_API}/releases/latest" | jq -r '.tag_name'
 }
 
-github_latest_tag() {
-  # GitHub API: latest release tag_name
-  curl -fsSL "https://api.github.com/repos/vzakharchenko/keycloak-radius-plugin/releases/latest" \
-    | jq -r '.tag_name'
-}
-
-download_release_zip() {
+gh_release_by_tag() {
   local tag="$1"
+  curl -fsSL "${GH_API}/releases/tags/${tag}"
+}
+
+pick_asset_url() {
+  # Pick a browser_download_url for an asset that matches a regex
+  local json="$1"
+  local regex="$2"
+  echo "$json" | jq -r --arg re "$regex" '
+    .assets[]
+    | select(.browser_download_url | test($re))
+    | .browser_download_url
+  ' | head -n 1
+}
+
+download_to() {
+  local url="$1"
   local out="$2"
-  local url="https://github.com/vzakharchenko/keycloak-radius-plugin/releases/download/${tag}/keycloak-radius.zip"
-  log "Lade Release-Zip: $url"
-  curl -fL --retry 3 --retry-delay 2 -o "$out" "$url"
+  log "Download: $url"
+  curl -fL --retry 3 --retry-delay 1 -o "$out" "$url"
+}
+
+clean_provider_dir() {
+  local providers_dir="$1"
+  # Remove jars that commonly cause split-package warnings or are not needed at runtime
+  rm -f \
+    "${providers_dir}"/*-tests.jar \
+    "${providers_dir}"/*-test.jar \
+    "${providers_dir}"/*-sources.jar \
+    "${providers_dir}"/*-javadoc.jar 2>/dev/null || true
 }
 
 write_radius_config() {
-  local cfg="$1"
-  local secret="$2"
+  local config_path="$1"
+  local shared_secret="$2"
+  local auth_port="$3"
+  local acct_port="$4"
 
-  mkdir -p "$(dirname "$cfg")"
+  mkdir -p "$(dirname "$config_path")"
 
-  # Minimal, bewährt aus deinem Setup: externalDictionary = null
-  cat > "$cfg" <<EOF
+  # If file exists, keep other settings but enforce values we manage.
+  if [[ -f "$config_path" ]]; then
+    log "Aktualisiere bestehende radius.config: $config_path"
+    tmp="$(mktemp)"
+    jq --arg s "$shared_secret" \
+       --argjson ap "$auth_port" \
+       --argjson acp "$acct_port" \
+       '
+       .sharedSecret=$s
+       | .authPort=$ap
+       | .accountPort=$acp
+       | .externalDictionary=null
+       ' "$config_path" > "$tmp"
+    mv "$tmp" "$config_path"
+  else
+    log "Erstelle radius.config: $config_path"
+    cat >"$config_path" <<EOF
 {
-  "sharedSecret": "${secret}",
-  "authPort": 1812,
-  "accountPort": 1813,
+  "sharedSecret": "$shared_secret",
+  "authPort": $auth_port,
+  "accountPort": $acct_port,
   "numberThreads": 8,
   "useUdpRadius": true,
   "externalDictionary": null,
@@ -86,103 +152,123 @@ write_radius_config() {
   }
 }
 EOF
+  fi
 
-  chmod 600 "$cfg"
+  chmod 600 "$config_path"
 }
 
-cleanup_bad_jars() {
-  local providers_dir="$1"
-  # Verhindert «split package» durch unnötige Tests/Sources/Javadoc JARs in providers
-  rm -f "$providers_dir"/*-tests.jar "$providers_dir"/*-sources.jar "$providers_dir"/*-javadoc.jar 2>/dev/null || true
-}
-
-install_from_zip() {
-  local zip="$1"
-  local providers_dir="$2"
-
-  local tmp
-  tmp="$(mktemp -d)"
-  unzip -q -o "$zip" -d "$tmp"
-
-  # Zip-Struktur variiert; wir suchen «radius-plugin*.jar» und kopieren NUR die Haupt-JAR
-  local jar
-  jar="$(find "$tmp" -type f -name 'radius-plugin-*.jar' \
-        ! -name '*-tests.jar' ! -name '*-sources.jar' ! -name '*-javadoc.jar' \
-        | head -n 1 || true)"
-
-  [[ -n "$jar" ]] || err "Konnte radius-plugin JAR im Zip nicht finden."
-
-  mkdir -p "$providers_dir"
-  log "Installiere Provider JAR: $(basename "$jar")"
-  cp -f "$jar" "$providers_dir/"
-
-  cleanup_bad_jars "$providers_dir"
-  rm -rf "$tmp"
-}
-
-rebuild_and_restart() {
-  local kc_home="$1"
-  local kc_bin="$kc_home/bin/kc.sh"
-
-  [[ -x "$kc_bin" ]] || err "kc.sh nicht gefunden/ausführbar: $kc_bin"
-
-  log "Keycloak build (Provider registrieren)…"
-  "$kc_bin" build
-
+restart_keycloak() {
   if systemctl list-unit-files | grep -q '^keycloak\.service'; then
-    log "Restart keycloak.service…"
     systemctl restart keycloak
     systemctl --no-pager -l status keycloak || true
   else
-    warn "Kein systemd keycloak.service gefunden. Starte Keycloak manuell mit: $kc_bin start --optimized"
+    warn "keycloak.service nicht gefunden. Bitte Keycloak manuell neu starten."
   fi
 }
 
 verify_ports() {
-  log "Prüfe, ob UDP 1812/1813 lauscht…"
-  ss -lunp | egrep ':1812|:1813' || warn "Noch keine Listener auf 1812/1813 sichtbar."
+  local auth_port="$1"
+  local acct_port="$2"
+  log "Port-Check (UDP): ${auth_port}/${acct_port}"
+  ss -lunp | egrep ":(${auth_port}|${acct_port})\b" || true
 }
 
 main() {
-  require_root
-  install_deps_debian
+  need_root
+  install_deps
 
-  local kc_home providers_dir cfg_dir cfg_file
-  kc_home="$(detect_keycloak_home)"
-  providers_dir="$kc_home/providers"
-  cfg_dir="$kc_home/config"
-  cfg_file="$cfg_dir/radius.config"
+  local KEYCLOAK_HOME
+  KEYCLOAK_HOME="$(detect_keycloak_home)"
+  log "Keycloak home: $KEYCLOAK_HOME"
 
-  log "Keycloak home: $kc_home"
-  log "Providers dir: $providers_dir"
-  log "Config file: $cfg_file"
+  local PROVIDERS_DIR="${KEYCLOAK_HOME}/providers"
+  mkdir -p "$PROVIDERS_DIR"
+  log "Providers dir: $PROVIDERS_DIR"
 
-  local default_secret
-  default_secret="$(openssl rand -base64 48 | tr -d '\n')"
-  local secret
-  secret="$(prompt_secret "$default_secret")"
-
-  # Tag bestimmen
-  local tag="${KC_RADIUS_TAG:-}"
-  if [[ -z "$tag" ]]; then
-    log "Ermittle latest release tag…"
-    tag="$(github_latest_tag)"
+  # ---- Tag selection (pin if provided) ----
+  local TAG="${KC_RADIUS_TAG:-}"
+  if [[ -z "$TAG" ]]; then
+    log "Ermittle latest release tag via GitHub API…"
+    TAG="$(gh_latest_tag)"
   fi
-  [[ -n "$tag" && "$tag" != "null" ]] || err "Konnte Release-Tag nicht ermitteln. Setze KC_RADIUS_TAG manuell."
+  [[ -n "$TAG" && "$TAG" != "null" ]] || die "Konnte Release-Tag nicht ermitteln."
+  log "Release tag: $TAG"
 
-  local zip="/tmp/keycloak-radius-${tag}.zip"
-  download_release_zip "$tag" "$zip"
+  local release_json
+  release_json="$(gh_release_by_tag "$TAG")"
 
-  install_from_zip "$zip" "$providers_dir"
-  write_radius_config "$cfg_file" "$secret"
+  # ---- Asset resolution: prefer runtime jar if present; fallback to source build instructions otherwise ----
+  # We try typical asset patterns:
+  # - radius-plugin-*.jar
+  # - keycloak-radius-plugin.jar (older naming)
+  # - any zip that contains built jars (last resort)
+  local RADIUS_JAR_URL
+  RADIUS_JAR_URL="$(pick_asset_url "$release_json" 'radius-plugin-.*\.jar$')"
+  if [[ -z "$RADIUS_JAR_URL" ]]; then
+    RADIUS_JAR_URL="$(pick_asset_url "$release_json" 'keycloak-radius-plugin.*\.jar$')"
+  fi
 
-  rebuild_and_restart "$kc_home"
-  verify_ports
+  if [[ -z "$RADIUS_JAR_URL" ]]; then
+    # Some releases may only ship zips. Try to pick a zip that likely contains providers.
+    local ZIP_URL
+    ZIP_URL="$(pick_asset_url "$release_json" 'keycloak-radius.*\.zip$')"
+    if [[ -z "$ZIP_URL" ]]; then
+      ZIP_URL="$(pick_asset_url "$release_json" '.*\.zip$')"
+    fi
+    [[ -n "$ZIP_URL" ]] || die "Kein passendes Asset (jar/zip) im Release gefunden. Tag: $TAG"
 
-  echo
-  log "Fertig."
-  log "Wichtig: Das Shared Secret brauchst du in UniFi (RADIUS Profile) 1:1 identisch."
-  log "Config: $cfg_file"
+    log "Release liefert kein direktes JAR. Verwende ZIP-Install (Extraktion und JAR-Suche)."
+    local tmpdir
+    tmpdir="$(mktemp -d)"
+    download_to "$ZIP_URL" "${tmpdir}/release.zip"
+    (cd "$tmpdir" && unzip -q release.zip)
+
+    # Find radius-plugin jar inside extracted content
+    local found
+    found="$(find "$tmpdir" -type f -name 'radius-plugin-*.jar' | head -n 1 || true)"
+    [[ -n "$found" ]] || die "Im ZIP wurde kein radius-plugin-*.jar gefunden."
+
+    log "Kopiere radius-plugin JAR aus ZIP: $found"
+    cp -f "$found" "$PROVIDERS_DIR/"
+    rm -rf "$tmpdir"
+  else
+    log "Lade radius plugin JAR aus Release…"
+    local out="${PROVIDERS_DIR}/$(basename "$RADIUS_JAR_URL")"
+    download_to "$RADIUS_JAR_URL" "$out"
+  fi
+
+  # Remove unneeded jars if present
+  clean_provider_dir "$PROVIDERS_DIR"
+
+  # ---- Config ----
+  local CONFIG_PATH="${KC_RADIUS_CONFIG_PATH:-${KEYCLOAK_HOME}/${RADIUS_CONFIG_DEFAULT_REL}}"
+  log "Config file: $CONFIG_PATH"
+
+  local DEFAULT_SECRET
+  DEFAULT_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
+
+  local SHARED_SECRET AUTH_PORT ACCT_PORT
+  prompt SHARED_SECRET "RADIUS Shared Secret (muss in UniFi identisch gesetzt werden)" "$DEFAULT_SECRET" "true"
+  prompt AUTH_PORT "RADIUS Auth Port" "1812" "false"
+  prompt ACCT_PORT "RADIUS Accounting Port" "1813" "false"
+
+  # Ensure numeric
+  [[ "$AUTH_PORT" =~ ^[0-9]+$ ]] || die "Auth Port ist keine Zahl."
+  [[ "$ACCT_PORT" =~ ^[0-9]+$ ]] || die "Accounting Port ist keine Zahl."
+
+  write_radius_config "$CONFIG_PATH" "$SHARED_SECRET" "$AUTH_PORT" "$ACCT_PORT"
+
+  # ---- Build & restart ----
+  log "kc.sh build…"
+  "${KEYCLOAK_HOME}/bin/kc.sh" build
+
+  log "Keycloak restart…"
+  restart_keycloak
+
+  verify_ports "$AUTH_PORT" "$ACCT_PORT"
+
+  log "Fertig. Shared Secret steht in: $CONFIG_PATH (sharedSecret)"
+  log "Hinweis: Für radtest/freeradius/unifi muss exakt dieses Shared Secret verwendet werden."
 }
 
 main "$@"
