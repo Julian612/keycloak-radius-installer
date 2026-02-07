@@ -1,211 +1,212 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================
-# Keycloak RADIUS Plugin Installer (vzakharchenko)
-# Für Keycloak via Proxmox Helper Script (LXC)
-# ============================
+# ==========================================
+# Keycloak RADIUS Plugin Installer (UniFi)
+# - Release-JAR Installation (no Maven)
+# - Creates /opt/keycloak/config/radius.config
+# - Builds Keycloak, restarts systemd service
+# ==========================================
 
-KEYCLOAK_DIR="/opt/keycloak"
-SRC_BASE="/opt/src"
-REPO_DIR="${SRC_BASE}/keycloak-radius-plugin"
-REPO_URL="https://github.com/vzakharchenko/keycloak-radius-plugin.git"
-KC_CONFIG_DIR="${KEYCLOAK_DIR}/config"
-RADIUS_CFG="${KC_CONFIG_DIR}/radius.config"
-PROVIDERS_DIR="${KEYCLOAK_DIR}/providers"
+KEYCLOAK_HOME="/opt/keycloak"
+PROVIDERS_DIR="${KEYCLOAK_HOME}/providers"
+CONFIG_DIR="${KEYCLOAK_HOME}/config"
+RADIUS_CFG="${CONFIG_DIR}/radius.config"
+SERVICE_NAME="keycloak"
 
-log()  { echo "[INFO]  $*"; }
-warn() { echo "[WARN]  $*" >&2; }
-err()  { echo "[ERROR] $*" >&2; }
-
-require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then stripping='Dieses Script muss als root laufen (sudo).'; err "$stripping"; exit 1; fi
-}
-
-require_keycloak() {
-  if [[ ! -x "${KEYCLOAK_DIR}/bin/kc.sh" ]]; then
-    err "Keycloak nicht gefunden unter ${KEYCLOAK_DIR}. Erwartet: ${KEYCLOAK_DIR}/bin/kc.sh"
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: Run as root."
     exit 1
   fi
-  mkdir -p "${KC_CONFIG_DIR}" "${PROVIDERS_DIR}" "${SRC_BASE}"
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+install_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates jq openssl
+}
+
+prompt_default() {
+  local prompt="$1"
+  local default="$2"
+  local var
+  read -r -p "${prompt} [${default}]: " var || true
+  if [[ -z "${var}" ]]; then
+    echo "${default}"
+  else
+    echo "${var}"
+  fi
 }
 
 prompt_secret() {
-  local secret=""
-  echo "RADIUS sharedSecret setzen."
-  echo "1) automatisch generieren (empfohlen)"
-  echo "2) manuell eingeben"
-  read -r -p "Auswahl [1/2] (Default: 1): " choice
-  choice="${choice:-1}"
-
-  if [[ "${choice}" == "2" ]]; then
-    read -r -s -p "sharedSecret (Eingabe wird nicht angezeigt): " secret
-    echo
-    if [[ -z "${secret}" ]]; then
-      err "Leeres sharedSecret ist nicht erlaubt."
-      exit 1
-    fi
-  else
-    secret="$(openssl rand -base64 48 | tr -d '\n')"
-    log "sharedSecret wurde generiert."
-  fi
-
-  echo "${secret}"
+  local prompt="$1"
+  local var
+  read -r -s -p "${prompt}: " var
+  echo
+  echo "${var}"
 }
 
-install_deps() {
-  log "Installiere Abhängigkeiten (git, jq, maven, build tools)…"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends \
-    ca-certificates curl git jq openssl \
-    maven \
-    build-essential
+ensure_paths() {
+  [[ -d "${KEYCLOAK_HOME}" ]] || { echo "ERROR: ${KEYCLOAK_HOME} not found"; exit 1; }
+  mkdir -p "${PROVIDERS_DIR}" "${CONFIG_DIR}"
 }
 
-clone_repo() {
-  log "Hole Repo: ${REPO_URL}"
-  if [[ -d "${REPO_DIR}/.git" ]]; then
-    git -C "${REPO_DIR}" fetch --all --tags
-    git -C "${REPO_DIR}" pull --ff-only || true
-  else
-    rm -rf "${REPO_DIR}"
-    git clone --depth 1 "${REPO_URL}" "${REPO_DIR}"
-  fi
-}
+download_plugin() {
+  local version_tag="$1"          # e.g. v1.6.1-26.4.0
+  local jar_name="$2"             # e.g. keycloak-radius-plugin.jar (depends on release assets)
+  local url="https://github.com/vzakharchenko/keycloak-radius-plugin/releases/download/${version_tag}/${jar_name}"
 
-# Wichtig: POM nicht voraussetzen, sondern finden
-find_pom() {
-  local pom=""
+  echo "[INFO] Downloading plugin: ${url}"
+  curl -fL "${url}" -o "${PROVIDERS_DIR}/${jar_name}"
 
-  # Bevorzugt: keycloak-plugins/pom.xml (typische Struktur)
-  if [[ -f "${REPO_DIR}/keycloak-plugins/pom.xml" ]]; then
-    pom="${REPO_DIR}/keycloak-plugins/pom.xml"
-    echo "${pom}"
-    return 0
-  fi
-
-  # Alternative: Root-POM
-  if [[ -f "${REPO_DIR}/pom.xml" ]]; then
-    pom="${REPO_DIR}/pom.xml"
-    echo "${pom}"
-    return 0
-  fi
-
-  # Fallback: erster POM in max depth 4
-  pom="$(find "${REPO_DIR}" -maxdepth 4 -type f -name "pom.xml" | head -n 1 || true)"
-  if [[ -n "${pom}" ]]; then
-    warn "Ungewöhnliche Repo-Struktur. Verwende gefundenen POM: ${pom}"
-    echo "${pom}"
-    return 0
-  fi
-
-  err "Kein pom.xml im Repo gefunden. Build nicht möglich."
-  err "Prüfe Repo-Inhalt unter: ${REPO_DIR}"
-  exit 1
-}
-
-build_plugin() {
-  local pom_file
-  pom_file="$(find_pom)"
-  log "Baue Plugin via Maven (POM: ${pom_file})…"
-
-  # Maven immer mit -f aufrufen, damit Working Directory egal ist
-  mvn -f "${pom_file}" -DskipTests package
-}
-
-copy_jars() {
-  log "Kopiere Provider-JARs nach ${PROVIDERS_DIR}…"
-
-  # Nur die „richtigen“ JARs (keine sources/javadoc/original/tests)
-  mapfile -t jars < <(
-    find "${REPO_DIR}" -type f -path "*/target/*.jar" \
-      ! -name "*-sources.jar" \
-      ! -name "*-javadoc.jar" \
-      ! -name "*-tests.jar" \
-      ! -name "original-*.jar"
-  )
-
-  if [[ "${#jars[@]}" -eq 0 ]]; then
-    err "Keine Build-JARs gefunden (target/*.jar). Maven-Build fehlgeschlagen oder anderer Build-Output."
-    exit 1
-  fi
-
-  # Optional: alte radius/mikrotik jars entfernen (um Dubletten zu vermeiden)
-  rm -f "${PROVIDERS_DIR}"/radius-plugin-*.jar "${PROVIDERS_DIR}"/mikrotik-radius-plugin-*.jar || true
-
-  for f in "${jars[@]}"; do
-    # nur die beiden relevanten Module, falls mehrere gebaut werden
-    case "$(basename "$f")" in
-      radius-plugin-*.jar|mikrotik-radius-plugin-*.jar)
-        cp -f "$f" "${PROVIDERS_DIR}/"
-        ;;
-    esac
-  done
-
-  log "Provider-Verzeichnis:"
-  ls -lh "${PROVIDERS_DIR}" | egrep -i 'radius|mikrotik' || true
+  # Keep only runtime jar(s) that match jar_name; optionally cleanup older radius artifacts
+  echo "[INFO] Providers directory after download:"
+  ls -lh "${PROVIDERS_DIR}" | sed -n '1,200p'
 }
 
 write_radius_config() {
-  log "Erzeuge ${RADIUS_CFG}…"
-  local secret
-  secret="$(prompt_secret)"
+  local shared_secret="$1"
+  local auth_port="$2"
+  local acct_port="$3"
+  local threads="$4"
+  local external_dict="$5"  # "null" or a path
 
-  # Default: externalDictionary null, damit Keycloak nicht /opt/dictionary verlangt
-  cat > "${RADIUS_CFG}" <<EOF
-{
-  "sharedSecret": "${secret}",
-  "authPort": 1812,
-  "accountPort": 1813,
-  "numberThreads": 8,
-  "useUdpRadius": true,
-  "externalDictionary": null,
-  "otpWithoutPassword": [],
-  "radsec": {
-    "useRadSec": false,
-    "privateKey": "config/private.key",
-    "certificate": "config/public.crt",
-    "numberThreads": 8
-  },
-  "coa": {
-    "useCoA": false,
-    "port": 3799
-  }
-}
-EOF
+  # externalDictionary can be null or a path (repo example uses /opt/dictionary)  [oai_citation:5‡GitHub](https://github.com/vzakharchenko/keycloak-radius-plugin)
+  if [[ "${external_dict}" == "null" ]]; then
+    jq -n \
+      --arg s "${shared_secret}" \
+      --argjson ap "${auth_port}" \
+      --argjson acp "${acct_port}" \
+      --argjson nt "${threads}" \
+      '{
+        sharedSecret: $s,
+        authPort: $ap,
+        accountPort: $acp,
+        numberThreads: $nt,
+        useUdpRadius: true,
+        externalDictionary: null,
+        otpWithoutPassword: [],
+        radsec: {useRadSec:false, privateKey:"config/private.key", certificate:"config/public.crt", numberThreads:$nt},
+        coa: {useCoA:false, port:3799}
+      }' > "${RADIUS_CFG}"
+  else
+    jq -n \
+      --arg s "${shared_secret}" \
+      --argjson ap "${auth_port}" \
+      --argjson acp "${acct_port}" \
+      --argjson nt "${threads}" \
+      --arg d "${external_dict}" \
+      '{
+        sharedSecret: $s,
+        authPort: $ap,
+        accountPort: $acp,
+        numberThreads: $nt,
+        useUdpRadius: true,
+        externalDictionary: $d,
+        otpWithoutPassword: [],
+        radsec: {useRadSec:false, privateKey:"config/private.key", certificate:"config/public.crt", numberThreads:$nt},
+        coa: {useCoA:false, port:3799}
+      }' > "${RADIUS_CFG}"
+  fi
 
   chmod 600 "${RADIUS_CFG}"
-  log "radius.config geschrieben (Rechte 600)."
+  echo "[INFO] Wrote ${RADIUS_CFG}:"
+  cat "${RADIUS_CFG}" | jq .
 }
 
-kc_build_restart() {
-  log "Keycloak build (Provider registrieren)…"
-  "${KEYCLOAK_DIR}/bin/kc.sh" build
+cleanup_non_runtime_jars() {
+  # Avoid copying/building tests/sources/javadoc into providers: reduces split-package warnings
+  # If you already have such jars, remove them:
+  rm -f "${PROVIDERS_DIR}"/*-tests.jar "${PROVIDERS_DIR}"/*-sources.jar "${PROVIDERS_DIR}"/*-javadoc.jar 2>/dev/null || true
+}
 
-  log "Keycloak via systemd neu starten…"
-  systemctl restart keycloak
+build_and_restart() {
+  echo "[INFO] Running kc.sh build…"
+  "${KEYCLOAK_HOME}/bin/kc.sh" build
 
-  log "Status:"
-  systemctl status keycloak --no-pager -l || true
+  echo "[INFO] Restarting ${SERVICE_NAME}…"
+  systemctl restart "${SERVICE_NAME}"
 
-  log "RADIUS Ports prüfen (1812/1813 UDP):"
-  ss -lunp | egrep ':1812|:1813' || true
+  echo "[INFO] systemctl status (short):"
+  systemctl --no-pager -l status "${SERVICE_NAME}" | sed -n '1,80p'
+}
 
-  log "Letzte Logs (Radius/Mikrotik):"
-  journalctl -u keycloak -n 120 --no-pager | egrep -i 'radius|mikrotik|provider|spi|error|warn' || true
+verify_listeners() {
+  local auth_port="$1"
+  local acct_port="$2"
+  echo "[INFO] UDP listeners (auth/account):"
+  ss -lunp | egrep ":${auth_port}\b|:${acct_port}\b" || true
+
+  echo "[INFO] Keycloak logs (radius-related):"
+  journalctl -u "${SERVICE_NAME}" -n 120 --no-pager | egrep -i 'radius|RadiusServer|KeycloakRadiusServer|error|warn' || true
+}
+
+print_next_steps() {
+  local auth_port="$1"
+  cat <<EOF
+
+[OK] Installation abgeschlossen.
+
+Wichtig:
+1) Shared Secret:
+   - Muss identisch sein in:
+     - ${RADIUS_CFG}  (sharedSecret)
+     - UniFi RADIUS Profile (Shared Secret)
+     - Tests (radtest, eapol_test etc.)
+
+2) UniFi:
+   - RADIUS Server: <IP deiner Keycloak-VM/LXC>
+   - Auth Port: ${auth_port}
+   - Accounting: wie konfiguriert in ${RADIUS_CFG}
+
+3) Wenn du FreeRADIUS radtest nutzt:
+   - "invalid Response Authenticator / Shared secret is incorrect" = Secret mismatch.
+
+EOF
 }
 
 main() {
-  require_root
-  require_keycloak
-  install_deps
-  clone_repo
-  build_plugin
-  copy_jars
-  write_radius_config
-  kc_build_restart
-  log "Fertig."
+  need_root
+  ensure_paths
+
+  if ! have_cmd jq || ! have_cmd openssl; then
+    echo "[INFO] Installing dependencies…"
+    install_deps
+  fi
+
+  echo "[INFO] Keycloak home: ${KEYCLOAK_HOME}"
+
+  # Pick a release that matches your Keycloak (example from repo: v1.6.1-26.4.0)  [oai_citation:6‡GitHub](https://github.com/vzakharchenko/keycloak-radius-plugin)
+  RELEASE_TAG="$(prompt_default "Keycloak-radius-plugin release tag" "v1.6.1-26.4.0")"
+  JAR_NAME="$(prompt_default "Release asset jar filename" "keycloak-radius-plugin.jar")"
+
+  # Shared Secret
+  gen_secret="$(openssl rand -base64 48 | tr -d '\n')"
+  echo "[INFO] Generated shared secret (can be overridden)."
+  shared_secret="$(prompt_default "RADIUS shared secret" "${gen_secret}")"
+
+  auth_port="$(prompt_default "RADIUS auth port" "1812")"
+  acct_port="$(prompt_default "RADIUS accounting port" "1813")"
+  threads="$(prompt_default "RADIUS numberThreads" "8")"
+
+  # externalDictionary: set to null unless you really need custom vendor dicts
+  ext_dict_choice="$(prompt_default "externalDictionary path (enter 'null' for none)" "null")"
+
+  echo "[INFO] Downloading plugin…"
+  download_plugin "${RELEASE_TAG}" "${JAR_NAME}"
+
+  echo "[INFO] Cleaning up non-runtime jars (tests/sources/javadoc)…"
+  cleanup_non_runtime_jars
+
+  echo "[INFO] Writing radius config…"
+  write_radius_config "${shared_secret}" "${auth_port}" "${acct_port}" "${threads}" "${ext_dict_choice}"
+
+  build_and_restart
+  verify_listeners "${auth_port}" "${acct_port}"
+  print_next_steps "${auth_port}"
 }
 
 main "$@"
